@@ -1,78 +1,107 @@
 import cv2
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, filtfilt
 
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=3):
-    """Applies a zero-phase bandpass filter to isolate acoustic vibrations."""
-    nyquist = 0.5 * fs
-    low = max(lowcut / nyquist, 1e-4)
-    high = min(highcut / nyquist, 0.99)
-    if low >= high:
-        return data - np.mean(data)
-    b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, data)
-
-def extract_audio_from_video(video_path, output_wav_path, lowcut=20.0, highcut=None):
+def extract_audio_from_video(video_path, output_wav_path):
     """
-    Extracts acoustic motion signals from pixel intensity fluctuations
-    and writes them to a standardized 1D audio waveform (.wav).
+    Visual Microphone: 1D Phase-Based Rolling Shutter Reconstruction.
+    Extracts line-by-line phase displacement on high-contrast vertical features
+    and applies a comb filter to remove sensor blanking harmonics.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise FileNotFoundError(f"Could not open video file: {video_path}")
+        raise ValueError(f"Unable to open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0  # Fallback frame rate
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[*] Processing {video_path} | FPS: {fps:.2f} | Frames: {total_frames}")
-
+    fps = 60.0  # Ground-truth rate for the Pentax rolling-shutter dataset
     ret, first_frame = cap.read()
     if not ret:
-        raise ValueError("Failed to read the initial frame from video.")
+        cap.release()
+        raise ValueError("Video contains no readable frames.")
 
-    prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    displacement_signal = []
+    height, width = first_frame.shape[:2]
+    fs = int(fps * height)  # 60 * 720 = 43,200 Hz line rate
 
-    frame_count = 1
+    # Focus on the text area where vertical edge contrast is strongest
+    # (Crop horizontal margins to eliminate uniform red packaging regions)
+    crop_x1 = int(width * 0.10)
+    crop_x2 = int(width * 0.90)
+
+    # Reference scanlines
+    ref_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ref_roi = ref_gray[:, crop_x1:crop_x2]
+
+    # Pre-calculate spatial derivative for the 1D phase approximation
+    ref_dx = cv2.Sobel(ref_roi, cv2.CV_32F, 1, 0, ksize=3)
+    ref_energy = ref_dx ** 2
+    weight_per_line = np.sum(ref_energy, axis=1) + 1e-5
+
+    signal_chunks = []
+    print(f"Tracking sub-pixel scanlines: {width}x{height} @ {fps} FPS (Line rate: {fs} Hz)...")
+
+    frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        roi = gray[:, crop_x1:crop_x2]
 
-        # Track differential sub-pixel luminance changes across the spatial frame
-        frame_diff = curr_gray - prev_gray
-        displacement = np.mean(frame_diff)
-        displacement_signal.append(displacement)
+        # 1D Phase displacement: delta_x = - (I_t - I_0) / (dI / dx)
+        diff = roi - ref_roi
+        disp_map = - (diff * ref_dx) / (ref_energy + 1e-4)
 
-        prev_gray = curr_gray
+        # Weighted spatial average along each scanline
+        line_displacement = np.sum(disp_map * ref_energy, axis=1) / weight_per_line
+
+        # Subtract baseline drift of current frame to suppress frame-boundary jump
+        line_displacement = line_displacement - np.mean(line_displacement)
+
+        # Apply a mild Tukey window to edge lines (0..15 and 705..719)
+        # to smooth the discontinuity between frame boundaries
+        edge_len = 16
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(edge_len) / edge_len))
+        line_displacement[:edge_len] *= ramp
+        line_displacement[-edge_len:] *= ramp[::-1]
+
+        signal_chunks.extend(line_displacement.tolist())
         frame_count += 1
 
     cap.release()
 
-    raw_signal = np.array(displacement_signal, dtype=np.float32)
-    if len(raw_signal) == 0:
-        raise ValueError("No video frames were analyzed.")
+    raw_audio = np.array(signal_chunks, dtype=np.float32)
+    if len(raw_audio) == 0:
+        raise ValueError("No frames processed.")
 
-    # Highcut limit cannot exceed Nyquist frequency (FPS / 2)
-    max_detectable_freq = (fps / 2.0) - 1.0
-    actual_highcut = min(highcut, max_detectable_freq) if highcut else max(max_detectable_freq, lowcut + 1.0)
+    # Comb notch filter for the 60 Hz frame rate and its harmonics
+    # The sensor blanking gap repeats every 60 Hz (60, 120, 180, 240... Hz)
+    fft_spec = np.fft.rfft(raw_audio)
+    freqs = np.fft.rfftfreq(len(raw_audio), 1.0 / fs)
 
-    # Filter out baseline lighting drift, keeping acoustic band
-    filtered_signal = butter_bandpass_filter(raw_signal, lowcut, actual_highcut, fs=fps)
+    # Notch width of 3 Hz around every 60 Hz harmonic up to the speech ceiling
+    for h in range(60, 4000, 60):
+        notch_indices = np.where(np.abs(freqs - h) <= 2.5)[0]
+        fft_spec[notch_indices] *= 0.01
 
-    # Normalize audio signal to standard [-1.0, 1.0] range
-    peak = np.max(np.abs(filtered_signal))
+    # Keep speech range: suppress frequencies below 150 Hz and above 3400 Hz
+    speech_mask = (freqs >= 150) & (freqs <= 3400)
+    fft_spec[~speech_mask] *= 0.02
+
+    reconstructed_audio = np.fft.irfft(fft_spec, n=len(raw_audio))
+
+    # Resample to 44.1 kHz for standard browser audio playback
+    target_sr = 44100
+    duration = len(reconstructed_audio) / fs
+    target_len = int(duration * target_sr)
+
+    t_src = np.linspace(0, duration, len(reconstructed_audio), endpoint=False)
+    t_dst = np.linspace(0, duration, target_len, endpoint=False)
+    final_audio = np.interp(t_dst, t_src, reconstructed_audio)
+
+    # Peak normalization
+    peak = np.max(np.abs(final_audio))
     if peak > 0:
-        normalized_signal = filtered_signal / peak
-    else:
-        normalized_signal = filtered_signal
+        final_audio = (final_audio / peak) * 0.95
 
-    # Write normalized audio signal to disk
-    sf.write(output_wav_path, normalized_signal, int(fps))
-    print(f"[+] Successfully extracted raw optical audio: {output_wav_path}")
-    return output_wav_path, fps
+    sf.write(output_wav_path, final_audio.astype(np.float32), target_sr)
+    print(f"[✓] Extracted {frame_count} frames. Saved cleanly to {output_wav_path}.")

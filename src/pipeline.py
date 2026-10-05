@@ -1,61 +1,42 @@
 import os
-import sys
 import numpy as np
 import soundfile as sf
-from scipy.signal import medfilt
-from visual_extractor import extract_audio_from_video
+from src.visual_extractor import extract_audio_from_video
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python src/pipeline.py data/<your_video.mp4>")
-        return
-
-    video_input = sys.argv[1]
-    if not os.path.exists(video_input):
-        print(f"Error: Target file not found: {video_input}")
-        return
-
-    os.makedirs("output", exist_ok=True)
-    raw_audio_path = os.path.join("output", "raw_recovered.wav")
-    cleaned_audio_path = os.path.join("output", "ai_cleaned.wav")
+def run_pipeline(video_path, raw_audio_path, cleaned_audio_path):
+    print("\n[1/2] Reconstructing optical acoustic waveform from rolling shutter...")
+    extract_audio_from_video(video_path, raw_audio_path)
     
-    # Step 1: Optical Extraction
-    print("\n[1/2] Extracting optical audio from video frames...")
-    try:
-        extract_audio_from_video(video_input, raw_audio_path)
-    except Exception as e:
-        print(f"Extraction Error: {e}")
-        sys.exit(1)
-
-    # Step 2: Adaptive Signal Denoising & Normalization
-    print("\n[2/2] Running signal enhancement & noise removal...")
+    print("\n[2/2] Applying Forensic Vocal Gain & Dynamic Expansion...")
     try:
         data, rate = sf.read(raw_audio_path)
         
-        # 1. Detrend signal (remove DC drift/lighting variations)
-        data_centered = data - np.mean(data)
+        # 1. Strip the initial transient spike (first 50ms) that kills normalization
+        trim_samples = int(rate * 0.05)
+        if len(data) > trim_samples:
+            data[:trim_samples] = 0.0
+            
+        # 2. Dynamic Speech AGC (Automatic Gain Control)
+        # Calculate moving RMS energy to pull the quiet speech phonemes up to audible volume
+        window_size = int(rate * 0.02)  # 20ms analysis window
+        padded = np.pad(data ** 2, (window_size//2, window_size//2), mode='edge')
+        energy = np.convolve(padded, np.ones(window_size)/window_size, mode='valid')
+        rms = np.sqrt(np.maximum(energy, 1e-6))
         
-        # 2. Median filter to remove visual sensor spikes/glitches
-        kernel_size = 3 if len(data_centered) >= 3 else 1
-        filtered = medfilt(data_centered, kernel_size=kernel_size)
+        # Compress dynamic range: amplify quiet speech parts
+        gain = 1.0 / (rms + 0.05)
+        gain = np.clip(gain, 0.5, 8.0)  # Safe gain bounds
+        amplified = data * gain
         
-        # 3. Peak normalization to boost signal audibility
-        max_val = np.max(np.abs(filtered))
-        if max_val > 0:
-            cleaned = (filtered / max_val) * 0.95
+        # 3. Final master normalization (0.95 Full Scale)
+        peak = np.max(np.abs(amplified))
+        if peak > 0:
+            final_audio = (amplified / peak) * 0.95
         else:
-            cleaned = filtered
+            final_audio = amplified
 
-        # Save enhanced audio
-        sf.write(cleaned_audio_path, cleaned.astype(np.float32), rate)
-        print(f"\n[✓] Pipeline Complete! Clean audio saved at: {cleaned_audio_path}")
+        sf.write(cleaned_audio_path, final_audio.astype(np.float32), rate)
+        print(f"\n[✓] Speech amplified and finalized: {cleaned_audio_path}")
         
     except Exception as e:
-        print(f"\n[!] Filter bypass fallback: {e}")
-        # Safe fallback: copy original raw audio
-        if os.path.exists(raw_audio_path):
-            data, rate = sf.read(raw_audio_path)
-            sf.write(cleaned_audio_path, data, rate)
-
-if __name__ == "__main__":
-    main()
+        print(f"Error in signal enhancement: {e}")
